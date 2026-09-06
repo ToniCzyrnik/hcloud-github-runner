@@ -21,6 +21,56 @@ This [GitHub Action](./action.sh) is written in Bash (Shell Script).
 Everything was carefully documented and kept as simple as possible.
 The aim is to enable quick and easy auditability of the code.
 
+## Local compatibility fork
+
+Additional optional inputs (existing defaults otherwise remain unchanged):
+
+* `firewall`: comma-separated positive firewall IDs (default `null`), applied
+  in the server creation payload.
+* `private_ipv4`: canonical dotted IPv4; requires exactly one positive ID in
+  `network`. Creation omits automatic network allocation, then attaches using
+  `attach_to_network` with the requested IP, polls the action and verifies the
+  network/IP in server readback before readiness. `label` and `server_id` outputs
+  remain available before attachment, including when attachment fails.
+* `registration_only`: boolean, default `false`. Requires `mode: delete`, an
+  explicit `name`, and no `server_id`. This only cleans GitHub registration:
+  **VM state is not checked or changed**. Use only after independently verifying
+  VM absence, never as an implicit fallback for missing create outputs.
+
+Ordinary deletion requires an explicit name and positive `server_id` before any
+mutation. VM and registration cleanup are attempted independently; any unknown
+or failed leg fails the action. A recognized Hetzner `404`/`not_found` means
+already absent; an accepted deletion is **not** verified VM absence. Callers
+must perform their own post-delete verification. Registration discovery scans
+100 runners per page (maximum 1,000 pages), validates inventory counts and
+rejects duplicate matching names. Retry cleanup with the same owned identity.
+Concurrent inventory changes can cause a safe failure requiring retry.
+
+New cleanup/attachment HTTP calls have 10-second connection and 30-second
+request limits; server DELETE retries additionally have a 60-second retry
+budget (an in-flight final request may finish after that budget). Discovery and
+attachment polling each stop starting requests after 300 seconds; one in-flight
+request/poll sleep can extend this bound. Attachment also honors `server_wait`.
+Existing create/registration HTTP behavior is unchanged.
+
+`runner_version: skip` skips installer checks/downloads for a preinstalled
+runner; an explicit version is used unchanged, and the default is still
+`latest`. Root execution, immediate service start, and disabled self-update
+remain unchanged. Creation and installation are not transactional or generally
+idempotent; cleanup is retryable under the identity contract above.
+
+Offline validation (requires local Bash, Python 3, jq, envsubst and ShellCheck):
+
+```bash
+shellcheck action.sh install.sh
+bash -n action.sh install.sh
+python3 tests/focused.py
+```
+
+Tests execute copied scripts in temporary fixtures with fail-closed fake curl,
+no fallback command PATH, fake credentials and fake dependency installation.
+They do not contact providers or install packages.
+
 ## Use Cases
 
 This section highlights how using Hetzner Cloud with self-hosted runners for your GitHub Actions CI/CD workflows can lead to significant cost savings and predictable billing compared to relying solely on GitHub-managed runners.

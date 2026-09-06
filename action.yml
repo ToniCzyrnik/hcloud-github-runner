@@ -28,6 +28,17 @@ inputs:
       Attach an IPv6 on the public NIC (true/false). If false, no IPv6 address will be attached.
     required: false
     default: 'true'
+  firewall:
+    description: Comma separated positive Firewall IDs applied in the server create request.
+    required: false
+    default: 'null'
+  private_ipv4:
+    description: Exact private IPv4 address; requires exactly one network ID. Attached and verified before readiness.
+    required: false
+  registration_only:
+    description: Delete registration only; requires delete mode, explicit name, and no server_id. VM state is not checked or changed.
+    required: false
+    default: 'false'
   github_token:
     description: >-
       Fine-grained GitHub Personal Access Token (PAT) with 'Read and write' access to 'Administration' assigned.
@@ -142,6 +153,9 @@ runs:
         INPUT_DELETE_WAIT: ${{ inputs.delete_wait }}
         INPUT_ENABLE_IPV4: ${{ inputs.enable_ipv4 }}
         INPUT_ENABLE_IPV6: ${{ inputs.enable_ipv6 }}
+        INPUT_FIREWALLS: ${{ inputs.firewall }}
+        INPUT_PRIVATE_IPV4: ${{ inputs.private_ipv4 }}
+        INPUT_REGISTRATION_ONLY: ${{ inputs.registration_only }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github_token }}
         INPUT_HCLOUD_TOKEN: ${{ inputs.hcloud_token }}
         INPUT_IMAGE: ${{ inputs.image }}

@@ -17,6 +17,12 @@
 # Create a on-demand self-hosted GitHub Actions Runner in Hetzner Cloud
 # https://docs.hetzner.cloud/#servers-create-a-server
 
+# Deliberately retain upstream non-errexit/nounset behavior: registration polling
+# expects jq misses. New cleanup/API paths check failures explicitly.
+set -o pipefail
+MY_SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || exit 1
+cd "$MY_SCRIPT_DIR" || exit 1
+
 # Function to exit the script with a failure message
 function exit_with_failure() {
 	echo >&2 "FAILURE: $1"  # Print error message to stderr
@@ -170,6 +176,19 @@ if [[ "$MY_NETWORKS" != "null" ]]; then
 	}
 fi
 
+# Optional firewall IDs and exact private IPv4 (one network only).
+MY_FIREWALLS=${INPUT_FIREWALLS:-null}
+if [[ "$MY_FIREWALLS" != "null" && ! "$MY_FIREWALLS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]; then
+	exit_with_failure "Firewall IDs must be comma-separated positive integers."
+fi
+MY_PRIVATE_IPV4=${INPUT_PRIVATE_IPV4:-}
+if [[ -n "$MY_PRIVATE_IPV4" ]]; then
+	[[ "$MY_NETWORKS" =~ ^[1-9][0-9]*$ ]] || exit_with_failure "private_ipv4 requires exactly one positive network ID."
+	jq -en --arg ip "$MY_PRIVATE_IPV4" '$ip | split(".") | length == 4 and all(.[];
+		test("^(0|[1-9][0-9]{0,2})$") and (tonumber <= 255))' >/dev/null \
+		|| exit_with_failure "private_ipv4 must be canonical dotted IPv4."
+fi
+
 # Set bash commands to run before the runner starts.
 # If INPUT_PRE_RUNNER_SCRIPT is set, use its value; otherwise, use "".
 MY_PRE_RUNNER_SCRIPT=${INPUT_PRE_RUNNER_SCRIPT:-""}
@@ -253,63 +272,89 @@ fi
 # DELETE
 #
 
-if [[ "$MY_MODE" == "delete" ]]; then
-	# Check if MY_HETZNER_SERVER_ID is an integer
-	if [[ ! "$MY_HETZNER_SERVER_ID" =~ ^[0-9]+$ ]]; then
-		exit_with_failure "Failed to get ID of the Hetzner Cloud Server!"
-	fi
+# Capture status separately: transport errors and unrecognized HTTP responses fail closed.
+function cleanup_request() {
+	MY_HTTP_BODY=$(curl -sS --connect-timeout 10 --max-time 30 --retry-max-time 60 -w '\n%{http_code}' "$@") || return 1
+	MY_HTTP_STATUS=${MY_HTTP_BODY##*$'\n'}
+	MY_HTTP_BODY=${MY_HTTP_BODY%$'\n'*}
+}
 
-	# Send a DELETE request to the Hetzner Cloud API to delete the server.
-	# https://docs.hetzner.cloud/#servers-delete-a-server
-	# curl retry: https://everything.curl.dev/usingcurl/downloads/retry.html
-	echo "Delete server..."
-	curl \
-		-X DELETE \
-		--retry "$MY_DELETE_WAIT" \
-		--retry-delay "$WAIT_SEC" \
-		--retry-all-errors \
-		--fail-with-body \
-		-H "Content-Type: application/json" \
+function delete_server() {
+	cleanup_request -X DELETE --retry "$MY_DELETE_WAIT" --retry-delay "$WAIT_SEC" \
 		-H "Authorization: Bearer ${MY_HETZNER_TOKEN}" \
-		"https://api.hetzner.cloud/v1/servers/$MY_HETZNER_SERVER_ID" \
-		|| exit_with_failure "Error deleting server!"
-	echo "Hetzner Cloud Server deleted successfully."
+		"https://api.hetzner.cloud/v1/servers/$MY_HETZNER_SERVER_ID" || return 1
+	case "$MY_HTTP_STATUS" in
+	200) jq -e '.action.id | numbers | select(. > 0)' <<< "$MY_HTTP_BODY" >/dev/null || return 1
+		echo "Hetzner Cloud Server deletion accepted." ;;
+	404) jq -e '.error.code == "not_found"' <<< "$MY_HTTP_BODY" >/dev/null || return 1
+		echo "Hetzner Cloud Server already absent." ;;
+	*) return 1 ;;
+	esac
+}
 
-	# List self-hosted runners for repository
-	# https://docs.github.com/en/rest/actions/self-hosted-runners?apiVersion=2022-11-28#list-self-hosted-runners-for-a-repository
-	echo "List self-hosted runners..."
-	curl -L \
-		--fail-with-body \
-		-o "github-runners.json" \
-		-H "Accept: application/vnd.github+json" \
-		-H "Authorization: Bearer ${MY_GITHUB_TOKEN}" \
-		-H "X-GitHub-Api-Version: 2022-11-28" \
-		"https://api.github.com/repos/${MY_GITHUB_REPOSITORY}/actions/runners" \
-		|| exit_with_failure "Failed to list GitHub Actions runners from repository!"
-
-	MY_GITHUB_RUNNER_ID=$(jq -er ".runners[] | select(.name == \"$MY_NAME\") | .id" < "github-runners.json")
-	# Check if MY_GITHUB_RUNNER_ID is an integer
-	if [[ ! "$MY_GITHUB_RUNNER_ID" =~ ^[0-9]+$ ]]; then
-		exit_with_failure "Failed to get ID of the GitHub Actions Runner!"
+function delete_registration() {
+	local MY_PAGE MY_COUNT MY_MATCHES MY_IDS="" MY_TOTAL="" MY_SEEN=0 MY_PAGE_TOTAL
+	local MY_DEADLINE=$((SECONDS + 300))
+	# Bound discovery; never delete from a partial or malformed inventory.
+	for ((MY_PAGE=1; MY_PAGE<=1000; MY_PAGE++)); do
+		((SECONDS < MY_DEADLINE)) || return 1
+		cleanup_request -H "Accept: application/vnd.github+json" \
+			-H "Authorization: Bearer ${MY_GITHUB_TOKEN}" \
+			-H "X-GitHub-Api-Version: 2022-11-28" \
+			"https://api.github.com/repos/${MY_GITHUB_REPOSITORY}/actions/runners?per_page=100&page=$MY_PAGE" || return 1
+		[[ "$MY_HTTP_STATUS" == "200" ]] || return 1
+		jq -e '(.total_count | type == "number" and . >= 0 and floor == .) and
+			(.runners | type == "array") and all(.runners[];
+			(.name | type == "string") and (.id | type == "number" and . > 0 and floor == .))' \
+			<<< "$MY_HTTP_BODY" >/dev/null || return 1
+		MY_PAGE_TOTAL=$(jq -r '.total_count' <<< "$MY_HTTP_BODY")
+		[[ -z "$MY_TOTAL" || "$MY_TOTAL" == "$MY_PAGE_TOTAL" ]] || return 1
+		MY_TOTAL=$MY_PAGE_TOTAL
+		MY_COUNT=$(jq '.runners | length' <<< "$MY_HTTP_BODY")
+		MY_MATCHES=$(jq -r --arg name "$MY_NAME" '.runners[] | select(.name == $name) | .id' <<< "$MY_HTTP_BODY")
+		if [[ -n "$MY_MATCHES" ]]; then MY_IDS+="${MY_MATCHES}"$'\n'; fi
+		MY_SEEN=$((MY_SEEN + MY_COUNT))
+		if ((MY_COUNT < 100)); then break; fi
+	done
+	((MY_PAGE <= 1000 && MY_SEEN == MY_TOTAL)) || return 1
+	if [[ -z "$MY_IDS" ]]; then
+		echo "GitHub Actions Runner already absent."
+		return 0
 	fi
-
-	# Delete a self-hosted runner from repository
-	# https://docs.github.com/en/rest/actions/self-hosted-runners?apiVersion=2022-11-28#delete-a-self-hosted-runner-from-a-repository
-	echo "Delete GitHub Actions Runner..."
-	curl -L \
-		-X DELETE \
-		--fail-with-body \
-		-H "Accept: application/vnd.github+json" \
+	MY_GITHUB_RUNNER_ID=${MY_IDS%$'\n'}
+	[[ "$MY_GITHUB_RUNNER_ID" =~ ^[1-9][0-9]*$ ]] || { echo >&2 "Ambiguous runner name; refusing registration deletion."; return 1; }
+	cleanup_request -X DELETE -H "Accept: application/vnd.github+json" \
 		-H "Authorization: Bearer ${MY_GITHUB_TOKEN}" \
 		-H "X-GitHub-Api-Version: 2022-11-28" \
-		"https://api.github.com/repos/${MY_GITHUB_REPOSITORY}/actions/runners/${MY_GITHUB_RUNNER_ID}" \
-		|| exit_with_failure "Failed to delete GitHub Actions Runner from repository! Please delete manually: https://github.com/${MY_GITHUB_REPOSITORY}/settings/actions/runners"
+		"https://api.github.com/repos/${MY_GITHUB_REPOSITORY}/actions/runners/${MY_GITHUB_RUNNER_ID}" || return 1
+	# GitHub 404 can hide authorization errors; rediscovery on retry proves absence.
+	[[ "$MY_HTTP_STATUS" == "204" ]] || return 1
 	echo "GitHub Actions Runner deleted successfully."
-	echo
-	echo "The Hetzner Cloud Server and its associated GitHub Actions Runner have been deleted successfully."
-	# Add GitHub Action job summary
-	# https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#adding-a-job-summary
-	echo "The Hetzner Cloud Server and its associated GitHub Actions Runner have been deleted successfully 🗑️" >> "$GITHUB_STEP_SUMMARY"
+}
+
+MY_REGISTRATION_ONLY=${INPUT_REGISTRATION_ONLY:-false}
+[[ "$MY_REGISTRATION_ONLY" == "true" || "$MY_REGISTRATION_ONLY" == "false" ]] || exit_with_failure "registration_only must be true or false."
+if [[ "$MY_REGISTRATION_ONLY" == "true" && ( "$MY_MODE" != "delete" || -n "$MY_HETZNER_SERVER_ID" ) ]]; then
+	exit_with_failure "registration_only requires delete mode and no server_id."
+fi
+if [[ "$MY_MODE" == "delete" ]]; then
+	[[ -n "${INPUT_NAME:-}" ]] || exit_with_failure "An explicit name is required for deletion."
+	if [[ "$MY_REGISTRATION_ONLY" == "false" && ! "$MY_HETZNER_SERVER_ID" =~ ^[1-9][0-9]*$ ]]; then
+		exit_with_failure "A positive server_id is required for deletion."
+	fi
+	MY_DELETE_FAILED=false
+	if [[ "$MY_REGISTRATION_ONLY" == "false" ]]; then
+		delete_server || { echo >&2 "Server cleanup failed or is unknown."; MY_DELETE_FAILED=true; }
+	fi
+	delete_registration || { echo >&2 "Registration cleanup failed or is unknown."; MY_DELETE_FAILED=true; }
+	[[ "$MY_DELETE_FAILED" == "false" ]] || exit_with_failure "Cleanup incomplete; retry with the same identity."
+	if [[ "$MY_REGISTRATION_ONLY" == "true" ]]; then
+		MY_SUMMARY="Registration cleanup complete. VM state was not checked or changed."
+	else
+		MY_SUMMARY="Server cleanup accepted or already absent; registration cleanup complete."
+	fi
+	echo "$MY_SUMMARY"
+	echo "$MY_SUMMARY" >> "$GITHUB_STEP_SUMMARY"
 	exit 0
 fi
 
@@ -393,10 +438,15 @@ if [[ "$MY_PRIMARY_IPV6" != "null" ]]; then
 	echo "Primary IPv6 ID added to create-server.json."
 fi
 # Add network configuration to the create-server.json file if MY_NETWORKS is not "null".
-if [[ "$MY_NETWORKS" != "null" ]]; then
+if [[ "$MY_NETWORKS" != "null" && -z "$MY_PRIVATE_IPV4" ]]; then
 	cp create-server.json create-server-network.json && \
 	jq ".networks += [$MY_NETWORKS]" < create-server-network.json > create-server.json && \
 	echo "Networks added to create-server.json."
+fi
+if [[ "$MY_FIREWALLS" != "null" ]]; then
+	cp create-server.json create-server-firewall.json || exit_with_failure "Failed to copy server configuration."
+	jq --argjson ids "[$MY_FIREWALLS]" '.firewalls = ($ids | map({firewall: .}))' \
+		< create-server-firewall.json > create-server.json || exit_with_failure "Failed to add firewalls."
 fi
 # Add SSH key configuration to the create-server.json file if MY_SSH_KEYS is not "null".
 if [[ "$MY_SSH_KEYS" != "null" ]]; then
@@ -425,7 +475,7 @@ while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
 	-H "Authorization: Bearer ${MY_HETZNER_TOKEN}" \
 	-d @create-server.json \
 	"https://api.hetzner.cloud/v1/servers"; then
-		echo "Server created successfully."
+		echo "Server creation accepted."
 		break
 	else
 		# Check if the error is related to resource unavailability
@@ -489,6 +539,39 @@ while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
 done
 if [[ "$MY_HETZNER_SERVER_STATUS" != "running" ]]; then
 	exit_with_failure "Failed to start Hetzner Cloud Server! Please check manually."
+fi
+
+# The create API assigns random network IPs. Instead attach with an explicit IP
+# using the supported action, then wait and read back before reporting readiness.
+if [[ -n "$MY_PRIVATE_IPV4" ]]; then
+	MY_ATTACH_BODY=$(jq -n --argjson network "$MY_NETWORKS" --arg ip "$MY_PRIVATE_IPV4" '{network: $network, ip: $ip}') || exit_with_failure "Invalid attachment payload."
+	cleanup_request -X POST -H "Content-Type: application/json" \
+		-H "Authorization: Bearer ${MY_HETZNER_TOKEN}" -d "$MY_ATTACH_BODY" \
+		"https://api.hetzner.cloud/v1/servers/$MY_HETZNER_SERVER_ID/actions/attach_to_network" \
+		|| exit_with_failure "Network attachment transport failure; server_id output remains available for cleanup."
+	[[ "$MY_HTTP_STATUS" == "201" ]] || exit_with_failure "Network attachment failed; clean up server_id."
+	MY_ATTACH_ID=$(jq -er '.action.id | numbers | select(. > 0 and floor == .)' <<< "$MY_HTTP_BODY") || exit_with_failure "Invalid attachment action."
+	MY_ATTACH_STATUS=""
+	MY_ATTACH_DEADLINE=$((SECONDS + 300))
+	for ((MY_ATTEMPT=0; MY_ATTEMPT<MY_SERVER_WAIT; MY_ATTEMPT++)); do
+		((SECONDS < MY_ATTACH_DEADLINE)) || exit_with_failure "Network attachment deadline exceeded."
+		cleanup_request -H "Authorization: Bearer ${MY_HETZNER_TOKEN}" \
+			"https://api.hetzner.cloud/v1/actions/$MY_ATTACH_ID" || exit_with_failure "Cannot query network attachment."
+		[[ "$MY_HTTP_STATUS" == "200" ]] || exit_with_failure "Cannot query network attachment."
+		MY_ATTACH_STATUS=$(jq -er '.action.status' <<< "$MY_HTTP_BODY") || exit_with_failure "Invalid attachment status."
+		case "$MY_ATTACH_STATUS" in
+		success) break ;;
+		running) sleep "$WAIT_SEC" ;;
+		*) exit_with_failure "Network attachment did not succeed." ;;
+		esac
+	done
+	[[ "$MY_ATTACH_STATUS" == "success" ]] || exit_with_failure "Network attachment timed out."
+	cleanup_request -H "Authorization: Bearer ${MY_HETZNER_TOKEN}" \
+		"https://api.hetzner.cloud/v1/servers/$MY_HETZNER_SERVER_ID" || exit_with_failure "Cannot verify private IP."
+	[[ "$MY_HTTP_STATUS" == "200" ]] || exit_with_failure "Cannot verify private IP status."
+	jq -e --argjson network "$MY_NETWORKS" --arg ip "$MY_PRIVATE_IPV4" \
+		'[.server.private_net[] | select(.network == $network and .ip == $ip)] | length == 1' \
+		<<< "$MY_HTTP_BODY" >/dev/null || exit_with_failure "Exact private IP verification failed."
 fi
 
 # Wait for GitHub Actions Runner registration

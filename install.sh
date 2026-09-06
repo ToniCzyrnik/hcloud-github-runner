@@ -18,6 +18,8 @@
 # https://github.com/actions/runner
 # https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#linux
 
+set -euo pipefail
+
 # Get the script's name
 MY_SCRIPT_NAME=$(basename "$0")
 
@@ -42,6 +44,25 @@ function usage {
 	[-h]                   Displays this message."
 	exit "$MY_RETURN_CODE"
 }
+
+# Process command line arguments
+while getopts ":v:d:h" opt; do
+	case $opt in
+	v)
+		MY_RUNNER_VERSION="$OPTARG"
+		;;
+	d)
+		MY_RUNNER_DIR="$OPTARG"
+		;;
+	h)
+		usage 0
+		;;
+	*)
+		echo "Invalid option: -$OPTARG"
+		usage 1
+		;;
+	esac
+done
 
 # If version is "skip", skip GitHub Actions Runner installation.
 if [[ "$MY_RUNNER_VERSION" = "skip" ]]; then
@@ -75,25 +96,6 @@ amd64|x86_64)
 	exit_with_failure "Cannot determine CPU architecture!"
 esac
 
-# Process command line arguments
-while getopts ":v:d:h" opt; do
-	case $opt in
-	v)
-		MY_RUNNER_VERSION="$OPTARG"
-		;;
-	d)
-		MY_RUNNER_DIR="$OPTARG"
-		;;
-	h)
-		usage 0
-		;;
-	*)
-		echo "Invalid option: -$OPTARG"
-		usage 1
-		;;
-	esac
-done
-
 # If version is "latest", fetch the latest version from GitHub API
 if [[ "$MY_RUNNER_VERSION" = "latest" ]]; then
 	MY_RUNNER_LATEST_VERSION=$(curl -sL "https://api.github.com/repos/actions/runner/releases/latest" | jq -r '.tag_name' | sed -e 's/^v//')
@@ -103,8 +105,7 @@ if [[ "$MY_RUNNER_VERSION" = "latest" ]]; then
 	fi
 	echo "GitHub Actions Runner version 'v${MY_RUNNER_LATEST_VERSION}' is detected as the latest version."
 else
-	echo "GitHub Actions Runner version 'v$MY_INPUT_RUNNER_VERSION' is specified as version."
-	MY_RUNNER_VERSION="$MY_INPUT_RUNNER_VERSION"
+	echo "GitHub Actions Runner version 'v$MY_RUNNER_VERSION' is specified as version."
 fi
 
 # Create directory (if it doesn't exist) and change to the installation directory
