@@ -448,6 +448,12 @@ if [[ "$MY_FIREWALLS" != "null" ]]; then
 	jq --argjson ids "[$MY_FIREWALLS]" '.firewalls = ($ids | map({firewall: .}))' \
 		< create-server-firewall.json > create-server.json || exit_with_failure "Failed to add firewalls."
 fi
+# Fixed-IP guests must not boot cloud-init before their network is attached.
+if [[ -n "$MY_PRIVATE_IPV4" ]]; then
+	cp create-server.json create-server-stopped.json || exit_with_failure "Failed to copy server configuration."
+	jq '.start_after_create = false' < create-server-stopped.json > create-server.json \
+		|| exit_with_failure "Failed to disable automatic start."
+fi
 # Add SSH key configuration to the create-server.json file if MY_SSH_KEYS is not "null".
 if [[ "$MY_SSH_KEYS" != "null" ]]; then
 	cp create-server.json create-server-ssh.json && \
@@ -510,68 +516,100 @@ fi
 echo "label=$MY_NAME" >> "$GITHUB_OUTPUT"
 echo "server_id=$MY_HETZNER_SERVER_ID" >> "$GITHUB_OUTPUT"
 
-# Wait for server
-MAX_RETRIES=$MY_SERVER_WAIT
-RETRY_COUNT=0
-echo "Wait for server..."
-while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
-	# Download and parse server status
-	# https://docs.hetzner.cloud/#servers-get-a-server
-	curl -s \
-		-o "servers.json" \
-		-H "Content-Type: application/json" \
-		-H "Authorization: Bearer ${MY_HETZNER_TOKEN}" \
-		"https://api.hetzner.cloud/v1/servers/$MY_HETZNER_SERVER_ID" \
-		|| exit_with_failure "Failed to get status of the Hetzner Cloud Server!"
+# Fixed-IP lifecycle calls use bounded requests and fail closed on unknown states.
+function wait_private_server() {
+	local target=$1 pending=$2 attempt status
+	local deadline=$((SECONDS + 300))
+	for ((attempt=0; attempt<MY_SERVER_WAIT; attempt++)); do
+		((SECONDS < deadline)) || return 1
+		cleanup_request -H "Authorization: Bearer ${MY_HETZNER_TOKEN}" \
+			"https://api.hetzner.cloud/v1/servers/$MY_HETZNER_SERVER_ID" || return 1
+		[[ "$MY_HTTP_STATUS" == "200" ]] || return 1
+		status=$(jq -er --argjson id "$MY_HETZNER_SERVER_ID" \
+			'.server | select(.id == $id) | .status' <<< "$MY_HTTP_BODY") || return 1
+		[[ "$status" != "$target" ]] || return 0
+		[[ "$status" == "$pending" ]] || return 1
+		sleep "$WAIT_SEC"
+	done
+	return 1
+}
 
-	MY_HETZNER_SERVER_STATUS=$(jq -er '.server.status' < "servers.json")
+# Handle one accepted mutation, never blindly retry its POST.
+function wait_private_action() {
+	local id status attempt
+	local deadline=$((SECONDS + 300))
+	id=$(jq -er '.action.id | numbers | select(. > 0 and floor == .)' <<< "$MY_HTTP_BODY") || return 1
+	status=$(jq -er '.action.status' <<< "$MY_HTTP_BODY") || return 1
+	[[ "$status" == "running" || "$status" == "success" ]] || return 1
+	for ((attempt=0; attempt<MY_SERVER_WAIT; attempt++)); do
+		((SECONDS < deadline)) || return 1
+		cleanup_request -H "Authorization: Bearer ${MY_HETZNER_TOKEN}" \
+			"https://api.hetzner.cloud/v1/actions/$id" || return 1
+		[[ "$MY_HTTP_STATUS" == "200" ]] || return 1
+		status=$(jq -er --argjson id "$id" '.action | select(.id == $id) | .status' <<< "$MY_HTTP_BODY") || return 1
+		case "$status" in
+		success) return 0 ;;
+		running) sleep "$WAIT_SEC" ;;
+		*) return 1 ;;
+		esac
+	done
+	return 1
+}
 
-	# Check if server is running
-	if [[ "$MY_HETZNER_SERVER_STATUS" == "running" ]]; then
-		echo "Server is running."
-		break
-	fi
-
-	RETRY_COUNT=$((RETRY_COUNT + 1)) # Increment retry counter
-
-	echo "Server is not running yet. Waiting $WAIT_SEC seconds... (Attempt $RETRY_COUNT/$MAX_RETRIES)"
-	sleep "$WAIT_SEC"
-done
-if [[ "$MY_HETZNER_SERVER_STATUS" != "running" ]]; then
-	exit_with_failure "Failed to start Hetzner Cloud Server! Please check manually."
-fi
-
-# The create API assigns random network IPs. Instead attach with an explicit IP
-# using the supported action, then wait and read back before reporting readiness.
 if [[ -n "$MY_PRIVATE_IPV4" ]]; then
+	wait_private_server off initializing || exit_with_failure "Server did not become off; clean up server_id."
 	MY_ATTACH_BODY=$(jq -n --argjson network "$MY_NETWORKS" --arg ip "$MY_PRIVATE_IPV4" '{network: $network, ip: $ip}') || exit_with_failure "Invalid attachment payload."
 	cleanup_request -X POST -H "Content-Type: application/json" \
 		-H "Authorization: Bearer ${MY_HETZNER_TOKEN}" -d "$MY_ATTACH_BODY" \
 		"https://api.hetzner.cloud/v1/servers/$MY_HETZNER_SERVER_ID/actions/attach_to_network" \
 		|| exit_with_failure "Network attachment transport failure; server_id output remains available for cleanup."
 	[[ "$MY_HTTP_STATUS" == "201" ]] || exit_with_failure "Network attachment failed; clean up server_id."
-	MY_ATTACH_ID=$(jq -er '.action.id | numbers | select(. > 0 and floor == .)' <<< "$MY_HTTP_BODY") || exit_with_failure "Invalid attachment action."
-	MY_ATTACH_STATUS=""
-	MY_ATTACH_DEADLINE=$((SECONDS + 300))
-	for ((MY_ATTEMPT=0; MY_ATTEMPT<MY_SERVER_WAIT; MY_ATTEMPT++)); do
-		((SECONDS < MY_ATTACH_DEADLINE)) || exit_with_failure "Network attachment deadline exceeded."
-		cleanup_request -H "Authorization: Bearer ${MY_HETZNER_TOKEN}" \
-			"https://api.hetzner.cloud/v1/actions/$MY_ATTACH_ID" || exit_with_failure "Cannot query network attachment."
-		[[ "$MY_HTTP_STATUS" == "200" ]] || exit_with_failure "Cannot query network attachment."
-		MY_ATTACH_STATUS=$(jq -er '.action.status' <<< "$MY_HTTP_BODY") || exit_with_failure "Invalid attachment status."
-		case "$MY_ATTACH_STATUS" in
-		success) break ;;
-		running) sleep "$WAIT_SEC" ;;
-		*) exit_with_failure "Network attachment did not succeed." ;;
-		esac
-	done
-	[[ "$MY_ATTACH_STATUS" == "success" ]] || exit_with_failure "Network attachment timed out."
+	wait_private_action || exit_with_failure "Network attachment action failed or timed out."
 	cleanup_request -H "Authorization: Bearer ${MY_HETZNER_TOKEN}" \
 		"https://api.hetzner.cloud/v1/servers/$MY_HETZNER_SERVER_ID" || exit_with_failure "Cannot verify private IP."
 	[[ "$MY_HTTP_STATUS" == "200" ]] || exit_with_failure "Cannot verify private IP status."
-	jq -e --argjson network "$MY_NETWORKS" --arg ip "$MY_PRIVATE_IPV4" \
-		'[.server.private_net[] | select(.network == $network and .ip == $ip)] | length == 1' \
-		<<< "$MY_HTTP_BODY" >/dev/null || exit_with_failure "Exact private IP verification failed."
+	jq -e --argjson id "$MY_HETZNER_SERVER_ID" --argjson network "$MY_NETWORKS" --arg ip "$MY_PRIVATE_IPV4" \
+		'.server | .id == $id and .status == "off" and
+		([.private_net[] | select(.network == $network and .ip == $ip)] | length == 1)' \
+		<<< "$MY_HTTP_BODY" >/dev/null || exit_with_failure "Exact private IP/off verification failed."
+	cleanup_request -X POST -H "Authorization: Bearer ${MY_HETZNER_TOKEN}" \
+		"https://api.hetzner.cloud/v1/servers/$MY_HETZNER_SERVER_ID/actions/poweron" \
+		|| exit_with_failure "Power on transport failure; clean up server_id."
+	[[ "$MY_HTTP_STATUS" == "201" ]] || exit_with_failure "Power on failed; clean up server_id."
+	wait_private_action || exit_with_failure "Power on action failed or timed out."
+	wait_private_server running starting || exit_with_failure "Server did not become running; clean up server_id."
+else
+	# Wait for server
+	MAX_RETRIES=$MY_SERVER_WAIT
+	RETRY_COUNT=0
+	echo "Wait for server..."
+	while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
+		# Download and parse server status
+		# https://docs.hetzner.cloud/#servers-get-a-server
+		curl -s \
+			-o "servers.json" \
+			-H "Content-Type: application/json" \
+			-H "Authorization: Bearer ${MY_HETZNER_TOKEN}" \
+			"https://api.hetzner.cloud/v1/servers/$MY_HETZNER_SERVER_ID" \
+			|| exit_with_failure "Failed to get status of the Hetzner Cloud Server!"
+
+		MY_HETZNER_SERVER_STATUS=$(jq -er '.server.status' < "servers.json")
+
+		# Check if server is running
+		if [[ "$MY_HETZNER_SERVER_STATUS" == "running" ]]; then
+			echo "Server is running."
+			break
+		fi
+
+		RETRY_COUNT=$((RETRY_COUNT + 1)) # Increment retry counter
+
+		echo "Server is not running yet. Waiting $WAIT_SEC seconds... (Attempt $RETRY_COUNT/$MAX_RETRIES)"
+		sleep "$WAIT_SEC"
+	done
+	if [[ "$MY_HETZNER_SERVER_STATUS" != "running" ]]; then
+		exit_with_failure "Failed to start Hetzner Cloud Server! Please check manually."
+	fi
+
 fi
 
 # Wait for GitHub Actions Runner registration

@@ -28,10 +28,14 @@ Additional optional inputs (existing defaults otherwise remain unchanged):
 * `firewall`: comma-separated positive firewall IDs (default `null`), applied
   in the server creation payload.
 * `private_ipv4`: canonical dotted IPv4; requires exactly one positive ID in
-  `network`. Creation omits automatic network allocation, then attaches using
-  `attach_to_network` with the requested IP, polls the action and verifies the
-  network/IP in server readback before readiness. `label` and `server_id` outputs
-  remain available before attachment, including when attachment fails.
+  `network`. Creation sets `start_after_create: false` and omits automatic network
+  allocation. After waiting for the server to be off, it attaches using
+  `attach_to_network`, polls the action, and verifies the exact server/network/IP
+  and off state in readback. Only then does it request power on once, poll that
+  action, and wait for running before checking registration. `label` and
+  `server_id` outputs are published immediately after create identity is known,
+  before off/attachment/start checks, and remain available on failure. Without
+  `private_ipv4`, automatic start and create-time network behavior are unchanged.
 * `registration_only`: boolean, default `false`. Requires `mode: delete`, an
   explicit `name`, and no `server_id`. This only cleans GitHub registration:
   **VM state is not checked or changed**. Use only after independently verifying
@@ -46,12 +50,17 @@ must perform their own post-delete verification. Registration discovery scans
 rejects duplicate matching names. Retry cleanup with the same owned identity.
 Concurrent inventory changes can cause a safe failure requiring retry.
 
-New cleanup/attachment HTTP calls have 10-second connection and 30-second
-request limits; server DELETE retries additionally have a 60-second retry
-budget (an in-flight final request may finish after that budget). Discovery and
-attachment polling each stop starting requests after 300 seconds; one in-flight
-request/poll sleep can extend this bound. Attachment also honors `server_wait`.
+New cleanup and fixed-IP lifecycle HTTP calls have 10-second connection and
+30-second request limits; server DELETE retries additionally have a 60-second
+retry budget (an in-flight final request may finish after that budget).
+Discovery and each fixed-IP lifecycle poll stop starting requests after 300
+seconds; one in-flight request/poll sleep can extend this bound. Fixed-IP polls
+also honor `server_wait`. Attachment and power-on POSTs are not retried; unknown,
+failed, or exhausted states fail without network fallback or registration checks.
 Existing create/registration HTTP behavior is unchanged.
+
+This removes the boot-before-attachment race; it does not prove live guest
+routing or SSH reachability. Callers still own exact cleanup verification.
 
 `runner_version: skip` skips installer checks/downloads for a preinstalled
 runner; an explicit version is used unchanged, and the default is still
